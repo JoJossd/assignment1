@@ -1,0 +1,9 @@
+{
+    "pythonVersion": "3.12",
+    "typeCheckingMode": "basic",
+    "venvPath": "/home/jojo/workspace/assignment1-basics",
+    "venv": ".venv",
+    "exclude": [
+        "tests"
+    ] // optional: hide test annotations from the linter
+}

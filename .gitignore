@@ -161,3 +161,11 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+.vscode
+.cursor
+
+data/
+bpe_output/
+cs336_docs/
+ckpt.pt
