@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Train BPE tokenizer on TinyStories dataset."""
+"""Train BPE tokenizer on TinyStories dataset.
+
+Example:
+cd /home/jojo/workspace/assignment1-basics
+
+uv run python ./cs336_run/train_bpe_tinystories.py
+"""
 
 import json
 import time
@@ -7,7 +13,7 @@ import psutil
 import os
 from pathlib import Path
 
-from cs336_basics.bpe_optimized import train_bpe
+from cs336_basics.bpe import train_bpe
 
 
 def format_bytes(size):
@@ -28,7 +34,7 @@ def get_memory_usage():
 def main():
     # Configuration
     input_path = Path("data/TinyStoriesV2-GPT4-train.txt")
-    output_dir = Path("bpe_output")
+    output_dir = Path("tokenizer_output")
     vocab_size = 10_000
     special_tokens = ["<|endoftext|>"]
 
@@ -68,8 +74,7 @@ def main():
         input_path=input_path,
         vocab_size=vocab_size,
         special_tokens=special_tokens,
-        use_parallel=True,  # Enable parallel processing
-        n_workers=None,  # Use default (cpu_count() // 2)
+        # Use default n_workers(cpu_count())
     )
 
     end_time = time.time()
@@ -123,7 +128,7 @@ def main():
             print("Yes - it's a common text pattern")
         else:
             print("Partially - contains some non-printable bytes")
-    except:
+    except Exception:
         print(f"  (Cannot decode as UTF-8)")
     print()
 
@@ -168,7 +173,7 @@ def main():
         try:
             decoded = longest_token_bytes.decode("utf-8", errors="replace")
             f.write(f"  Decoded: {repr(decoded)}\n")
-        except:
+        except Exception:
             f.write(f"  (Cannot decode as UTF-8)\n")
     print(f"  Summary saved to: {summary_path}")
 

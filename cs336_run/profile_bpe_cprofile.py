@@ -6,7 +6,7 @@ import pstats
 from pathlib import Path
 from pstats import SortKey
 
-from cs336_basics.bpe_optimized import train_bpe as train_bpe_optimized
+from cs336_basics.bpe import train_bpe
 
 
 def run_training():
@@ -15,11 +15,10 @@ def run_training():
     vocab_size = 10_000
     special_tokens = ["<|endoftext|>"]
 
-    vocab, merges = train_bpe_optimized(
+    vocab, merges = train_bpe(
         input_path=input_path,
         vocab_size=vocab_size,
         special_tokens=special_tokens,
-        use_parallel=True,
         n_workers=None,
     )
 

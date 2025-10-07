@@ -18,10 +18,15 @@ import regex as re  # 'regex' package (supports \p{} etc.)
 from collections import Counter, defaultdict
 from multiprocessing import Pool, cpu_count
 
-# GPT-2 pretokenizer pattern (from the assignment)
+# GPT-2 pretokenizer regex pattern:
+# - matches contractions like "'s", "'t", "'re" etc.
+# - sequences of letters (\p{L}+), numbers (\p{N}+),
+# - chunks of punctuation / symbols, and whitespace runs.
+# This mirrors tiktoken's PAT to ensure compatibility.
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-# Default split token for chunking (always <|endoftext|>)
+# Default special token boundary used for chunking large files.
+# Training can split work at occurrences of this token for parallelism.
 SPLIT_TOKEN_BYTES = b"<|endoftext|>"
 
 
@@ -30,6 +35,14 @@ SPLIT_TOKEN_BYTES = b"<|endoftext|>"
 # ============================================================================
 
 
+# =============================================================================
+# _find_chunk_boundaries()
+# Determine safe chunk boundaries for parallel processing.
+# Strategy: pick N tentative offsets, then scan forward up to a window
+# to find the next occurrence of a split token (like <|endoftext|>).
+# Returns byte offsets [(start, end), ...] that align on token boundaries.
+# Complexity: O(file_size) worst-case to scan windows, but amortized small.
+# =============================================================================
 def _find_chunk_boundaries(
     file: BinaryIO,
     desired_num_chunks: int,
@@ -89,6 +102,12 @@ def _find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
+# =============================================================================
+# _split_on_specials()
+# Split text while PRESERVING special tokens in output.
+# Uses a compiled regex with capturing groups so specials are not dropped.
+# Example: 'hi<|endoftext|>bye' -> ['hi', '<|endoftext|>', 'bye'].
+# =============================================================================
 def _split_on_specials(text: str, special_tokens: list[str]) -> list[str]:
     """
     Split text on any of the special tokens, **preserving** them as separate items.
@@ -118,6 +137,13 @@ def _split_on_specials(text: str, special_tokens: list[str]) -> list[str]:
     return [p for p in parts if p != ""]
 
 
+# =============================================================================
+# _pretokens_and_counts_from_file()
+# Serial pretokenization & counting.
+# Reads the file, applies GPT-2 PAT over non-special spans, and
+# represents each token as a tuple of single-byte tokens.
+# Returns a dict: {tuple(bytes,...): count}. No global order needed for BPE.
+# =============================================================================
 def _pretokens_and_counts_from_file(
     path: str, special_tokens: list[str]
 ) -> tuple[dict[tuple[bytes, ...], int], list[str]]:
@@ -205,6 +231,12 @@ def _pretokens_and_counts_from_file(
     return dict(counts), specials_sequence
 
 
+# =============================================================================
+# _process_chunk()
+# Worker-side routine used in parallel counting.
+# Input is (chunk_bytes, special_tokens). It decodes to text, splits on specials,
+# runs PAT on non-special pieces, and returns a local Counter-like dict.
+# =============================================================================
 def _process_chunk(chunk_data: tuple[bytes, list[str]]) -> dict[tuple[bytes, ...], int]:
     """
     Process a single chunk of data and return pretoken counts.
@@ -250,6 +282,12 @@ def _process_chunk(chunk_data: tuple[bytes, list[str]]) -> dict[tuple[bytes, ...
     return dict(counts)
 
 
+# =============================================================================
+# _merge_counts()
+# Merge a list of local count dicts from workers into a single dict.
+# We use explicit loops/dicts instead of Counter to avoid object overhead
+# in hot paths. Equivalent to sum(Counter(dicts)), but faster here.
+# =============================================================================
 def _merge_counts(count_dicts: list[dict[tuple[bytes, ...], int]]) -> dict[tuple[bytes, ...], int]:
     """
     Merge multiple count dictionaries by summing counts for each key.
@@ -281,8 +319,14 @@ def _merge_counts(count_dicts: list[dict[tuple[bytes, ...], int]]) -> dict[tuple
     return dict(merged)
 
 
+# =============================================================================
+# _pretokens_and_counts_from_file_parallel()
+# Parallel pretokenization & counting.
+# Pipeline: find chunk boundaries -> submit chunks to workers -> merge counts.
+# Note: order of special tokens across chunks is not preserved (not required for training).
+# =============================================================================
 def _pretokens_and_counts_from_file_parallel(
-    path: str, special_tokens: list[str], n_workers: int | None = None
+    path: str, special_tokens: list[str], n_workers: int
 ) -> tuple[dict[tuple[bytes, ...], int], list[str]]:
     """
     Build frequency table of pretokens using parallel processing.
@@ -307,20 +351,17 @@ def _pretokens_and_counts_from_file_parallel(
     Args:
         path: Path to input file
         special_tokens: List of special token strings
-        n_workers: Number of worker processes (defaults to cpu_count())
+        n_workers: Number of worker processes
 
     Returns:
         Tuple of (pretoken_counts, specials_seen_sequence)
     """
-    if n_workers is None:
-        n_workers = cpu_count() // 2
+    assert n_workers is not None
 
     # Split file into chunks
     if not special_tokens:
         # Can't use chunking without a split token
         return _pretokens_and_counts_from_file(path, special_tokens)
-
-    print("\n  execute in parallel: ")  # zxlog
 
     with open(path, "rb") as f:
         boundaries: list[int] = _find_chunk_boundaries(f, n_workers, SPLIT_TOKEN_BYTES)
@@ -351,6 +392,11 @@ def _pretokens_and_counts_from_file_parallel(
 # ============================================================================
 
 
+# =============================================================================
+# _count_pairs()
+# Count adjacent byte-pairs across all sequences weighted by sequence frequency.
+# Result: dict[(byte, byte)] = frequency. This drives the greedy BPE loop.
+# =============================================================================
 def _count_pairs(pretoken_counts: dict[tuple[bytes, ...], int]) -> dict[tuple[bytes, bytes], int]:
     """
     Weighted count of adjacent pairs across all pretokens.
@@ -367,6 +413,12 @@ def _count_pairs(pretoken_counts: dict[tuple[bytes, ...], int]) -> dict[tuple[by
     return pair_counts
 
 
+# =============================================================================
+# _apply_merge_to_seq()
+# Apply a single merge (a,b)->ab to one sequence.
+# Replace non-overlapping occurrences in a single left-to-right pass.
+# Returns the new tuple of bytes tokens after merging.
+# =============================================================================
 def _apply_merge_to_seq(seq: tuple[bytes, ...], merge_pair: tuple[bytes, bytes]) -> tuple[bytes, ...]:
     """
     Replace all non-overlapping occurrences of pair in seq with merged token.
@@ -400,6 +452,12 @@ def _apply_merge_to_seq(seq: tuple[bytes, ...], merge_pair: tuple[bytes, bytes])
     return tuple(out)
 
 
+# =============================================================================
+# _update_pair_counts_after_merge()
+# Incrementally update pair counts after applying a merge to a sequence.
+# Avoids recomputing all pairs from scratch each iteration.
+# Subtract old pairs from old sequence; add new pairs from new sequence.
+# =============================================================================
 def _update_pair_counts_after_merge(
     pair_counts: dict[tuple[bytes, bytes], int],
     old_seq: tuple[bytes, ...],
@@ -423,6 +481,15 @@ def _update_pair_counts_after_merge(
             pair_counts[(a, b)] = pair_counts.get((a, b), 0) + freq
 
 
+# =============================================================================
+# train_bpe()
+# Main training loop.
+# 1) Get pretoken counts (serial or parallel).
+# 2) Initialize pair counts.
+# 3) Repeat until vocab_size: pick best pair, record merge, update sequences
+#    and adjust pair counts incrementally.
+# Returns (vocab: id->bytes, merges: list[(bytes,bytes)] in merge order).
+# =============================================================================
 def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -443,7 +510,6 @@ def train_bpe(
         vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
         special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
         **kwargs: Optional keyword arguments:
-            - use_parallel (bool): If True, use parallel processing for counting (default: True)
             - n_workers (int | None): Number of worker processes for parallel mode (default: cpu_count())
 
     Returns:
@@ -455,16 +521,11 @@ def train_bpe(
         raise ValueError("vocab_size too small for 256 base bytes + special tokens")
 
     # 1) Pretokenize and count (bytes-level, weighted)
-    use_parallel: bool = kwargs.get("use_parallel", True)
-    n_workers: int | None = kwargs.get("n_workers", cpu_count() // 2)
-
-    print(f"\n  use_parallel: {use_parallel}")
+    n_workers: int = kwargs.get("n_workers", cpu_count())
+    assert n_workers is not None
 
     pretoken_counts: dict[tuple[bytes, ...], int]
-    if use_parallel:
-        pretoken_counts, _ = _pretokens_and_counts_from_file_parallel(str(input_path), special_tokens, n_workers)
-    else:
-        pretoken_counts, _ = _pretokens_and_counts_from_file(str(input_path), special_tokens)
+    pretoken_counts, _ = _pretokens_and_counts_from_file_parallel(str(input_path), special_tokens, n_workers)
 
     # 2) Iteratively select merges with optimized incremental updates
     merges: list[tuple[bytes, bytes]] = []
@@ -498,6 +559,7 @@ def train_bpe(
             break
 
         # OPTIMIZATION: Only process sequences that contain best_pair
+        # Q? bypass copy here?
         affected_seqs = seq_index.get(best_pair, set()).copy()  # Copy to avoid modification during iteration
         new_pretoken_counts: Counter[tuple[bytes, ...]] = Counter()
 

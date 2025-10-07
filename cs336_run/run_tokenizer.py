@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# encode_corpus.py — CS336 A1 utility
+# run_tokenizer.py — CS336 A1 utility
 # Encode raw text into a flat sequence of token IDs and save as .bin files.
 #
 # Reuses tokenizer utilities from tokenizer.py (and expects a trained BPE
@@ -10,23 +10,24 @@
 """
 cd /home/jojo/workspace/assignment1-basics
 
-uv run python ./cs336_run/encode_corpus.py \
+uv run python ./cs336_run/run_tokenizer.py \
     --input ./data/TinyStoriesV2-GPT4-valid.txt \
     --vocab ./bpe_output/vocab.json \
     --merges ./bpe_output/merges.txt \
     --out ./bpe_output/TinyStoriesV2-GPT4/valid.bin
 
-uv run python ./cs336_run/encode_corpus.py \
+uv run python ./cs336_run/run_tokenizer.py \
     --input ./data/TinyStoriesV2-GPT4-train.txt \
     --vocab ./bpe_output/vocab.json \
     --merges ./bpe_output/merges.txt \
-    --out ./bpe_output/TinyStoriesV2-GPT4/train.bin
+    --out ./bpe_output/TinyStoriesV2-GPT4/train.bin \
+    --buffer-tokens 32768
 """
 
 #
 # Optionally split into train/val in one pass:
 #
-#   python encode_corpus.py \
+#   python run_tokenizer.py \
 #     --input ./data/tinystories/all.txt \
 #     --vocab ./gpt2_vocab.json --merges ./gpt2_merges.txt \
 #     --out-prefix ./data/tinystories/tokens \
@@ -45,7 +46,7 @@ from collections.abc import Iterable
 import numpy as np
 
 # Local imports from your assignment repo
-import cs336_basics.tokenizer as tok_mod
+from cs336_basics.tokenizer import Tokenizer
 
 
 def _resolve_inputs(inp: str) -> list[Path]:
@@ -65,7 +66,7 @@ def _resolve_inputs(inp: str) -> list[Path]:
 
 def _iter_text(paths: list[Path]) -> Iterable[str]:
     for path in paths:
-        with open(path, "r", encoding="utf-8", newline="\n", errors="ignore") as f:
+        with open(path, encoding="utf-8", newline="\n", errors="ignore") as f:
             yield from f
 
 
@@ -96,43 +97,85 @@ def main():
         "--special", type=str, nargs="*", default=None, help="optional special tokens list (e.g. <|bos|> <|eos|>)"
     )
 
+    ap.add_argument(
+        "--buffer-tokens",
+        type=int,
+        default=262144,
+        help="number of token ids to buffer before flushing to disk (lower -> less RAM)",
+    )
+
     args = ap.parse_args()
 
     # Build tokenizer from disk using helpers in tokenizer.py
-    tokenizer = tok_mod.get_tokenizer_from_files(
+    tokenizer = Tokenizer.from_files(
         args.vocab,
         args.merges,
         special_tokens=args.special,
     )
 
-    # Encode all text lines
+    # Resolve inputs and pick dtype
     paths = _resolve_inputs(args.input)
-    print(f"[encode_corpus] encoding {len(paths)} file(s) ...")
-    ids: list[int] = []
+    print(f"[run_tokenizer] encoding {len(paths)} file(s) ...")
 
-    # Stream line-by-line to avoid loading everything into RAM at once.
-    # BPE encoding is local per line (no cross-line state), so this is safe.
+    vocab_size = getattr(tokenizer, "vocab_size", None) or getattr(tokenizer, "n_vocab", None)
+    if vocab_size is not None and vocab_size <= 65535:
+        dtype = np.uint16
+    else:
+        dtype = np.int32
+
+    # Streaming single-dataset output path (lowest memory)
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        buffer_ids: list[int] = []
+        total_tokens = 0
+        n_lines = 0
+
+        with open(out_path, "wb") as f:
+            for line in _iter_text(paths):
+                n_lines += 1
+                encoded = tokenizer.encode(line)
+                buffer_ids.extend(encoded)
+
+                if len(buffer_ids) >= args.buffer_tokens:
+                    np.asarray(buffer_ids, dtype=dtype).tofile(f)
+                    total_tokens += len(buffer_ids)
+                    buffer_ids.clear()
+
+                if n_lines % 100000 == 0:
+                    print(f"  processed {n_lines} lines, tokens so far: {total_tokens + len(buffer_ids)}")
+
+            # final flush
+            if buffer_ids:
+                np.asarray(buffer_ids, dtype=dtype).tofile(f)
+                total_tokens += len(buffer_ids)
+                buffer_ids.clear()
+
+        if total_tokens == 0:
+            raise RuntimeError("No tokens produced. Are your inputs empty?")
+
+        meta = {
+            "dtype": str(dtype),
+            "count": int(total_tokens),
+            "vocab_size": int(vocab_size) if vocab_size is not None else None,
+        }
+        with open(out_path.with_suffix(out_path.suffix + ".meta.json"), "w", encoding="utf-8") as mf:
+            json.dump(meta, mf)
+        print(f"[run_tokenizer] wrote {total_tokens} tokens -> {out_path} ({dtype})")
+        return
+
+    # If not single-output, fall back to in-memory accumulation (compatible with split logic)
+    ids: list[int] = []
     n_lines = 0
     for line in _iter_text(paths):
         n_lines += 1
         ids.extend(tokenizer.encode(line))
-
-        # light progress print
         if n_lines % 100000 == 0:
             print(f"  processed {n_lines} lines, tokens so far: {len(ids)}")
 
-    total = len(ids)
-    if total == 0:
+    if len(ids) == 0:
         raise RuntimeError("No tokens produced. Are your inputs empty?")
-
-    # Q? int32 datatype is too large?
-    # Choose dtype based on vocab size if available, default to int32 if unsure.
-    # Many CS336 tokenizers expose tokenizer.vocab_size or tokenizer.n_vocab. Try best-effort.
-    vocab_size = getattr(tokenizer, "vocab_size", None) or getattr(tokenizer, "n_vocab", None)
-    if vocab_size is not None and vocab_size <= 65535:
-        dtype = np.uint8
-    else:
-        dtype = np.uint8
 
     arr = np.array(ids, dtype=dtype)
 
@@ -149,7 +192,7 @@ def main():
         }
         with open(out_path.with_suffix(out_path.suffix + ".meta.json"), "w", encoding="utf-8") as mf:
             json.dump(meta, mf)
-        print(f"[encode_corpus] wrote {arr.size} tokens -> {out_path} ({dtype})")
+        print(f"[run_tokenizer] wrote {arr.size} tokens -> {out_path} ({dtype})")
         return
 
     # Train/val split output
@@ -177,7 +220,7 @@ def main():
         with open(out_train.with_suffix(out_train.suffix + ".meta.json"), "w", encoding="utf-8") as mf:
             json.dump(meta, mf, indent=2)
         print(
-            f"[encode_corpus] wrote train: {train_arr.size} -> {out_train}; val: {val_arr.size} -> {out_val} ({dtype})"
+            f"[run_tokenizer] wrote train: {train_arr.size} -> {out_train}; val: {val_arr.size} -> {out_val} ({dtype})"
         )
         return
 

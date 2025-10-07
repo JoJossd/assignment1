@@ -1,13 +1,15 @@
-# tokenizer.py
 import json
 import regex as re  # 'regex' package (supports \p{} etc.)
 import ast
 from pathlib import Path
 from .bpe import PAT
+from collections.abc import Iterable
 
 
 """
 Mental model diagram:
+Preserve special tokens intact; route non-special spans through byte-BPE.
+
 [text] --split by special-->  [chunk | SPECIAL | chunk | ...]
    chunk --PAT--> [piece][piece]...
      piece -> UTF-8 bytes -> [b'a', b'b', b' ', b'a', b'b']
@@ -19,15 +21,28 @@ Concatenate all ids → final token id stream
 """
 
 
-def _build_special_regex(special_tokens):
+def _build_special_regex(special_tokens: list[str] | None) -> re.Pattern:
     if not special_tokens:
         return re.compile(r"(?!x)x")  # never matches
     parts = [re.escape(tok) for tok in sorted(special_tokens, key=len, reverse=True)]
     return re.compile(f"({'|'.join(parts)})")
 
 
+# =============================================================================
+# Tokenizer
+# Runtime byte-level BPE tokenizer.
+# Holds vocab (id->bytes), merges (ordered), and derived structures:
+# - bytes_to_id: inverse vocab for fast lookup
+# - rank: merge pair -> priority index (lower is earlier -> higher priority)
+# - compiled regexes: specials + GPT-2 PAT for pretokenization
+# =============================================================================
 class Tokenizer:
-    def __init__(self, vocab, merges, special_tokens=None):
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ) -> None:
         """
         vocab: dict[int, bytes]
         merges: list[tuple[bytes, bytes]]
@@ -57,18 +72,23 @@ class Tokenizer:
         self._pat_re = re.compile(PAT)
 
     @classmethod
-    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None,
+    ) -> "Tokenizer":
         vocab = _load_vocab_file(vocab_filepath)
         merges = _load_merges_file(merges_filepath)
         return cls(vocab, merges, special_tokens)
 
-    def encode(self, text):
+    def encode(self, text: str) -> list[int]:
         if not text:
             return []
 
         ids = []
         if self.special_tokens:
-            # Split on special tokens while preserving them
+            # Preserve special tokens intact; route non-special spans through byte-BPE.
             # Note: _special_re is compiled with a capturing group, so split() keeps the delimiters
             for piece in self._special_re.split(text):
                 if not piece:
@@ -79,9 +99,10 @@ class Tokenizer:
                     ids.extend(self._encode_plain(piece))
         else:
             ids.extend(self._encode_plain(text))
+        # Final list of token IDs.
         return ids
 
-    def encode_iterable(self, iterable):
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
         for chunk in iterable:
             yield from self.encode(chunk)
 
@@ -91,7 +112,10 @@ class Tokenizer:
 
     # ---------- internals ----------
 
-    def _encode_plain(self, text):
+    def _get_pairs(self, seq) -> set[tuple[bytes, bytes]]:
+        return {(seq[i], seq[i + 1]) for i in range(len(seq) - 1)}
+
+    def _encode_plain(self, text: str) -> list[int]:
         if not text:
             return []
 
@@ -104,16 +128,15 @@ class Tokenizer:
             if not b:
                 continue
 
-            tokens = [bytes((bt,)) for bt in b]
+            # tokens is a list of one-byte bytes objects, each representing a single byte from the UTF-8 encoded piece.
+            tokens = [bytes([bt]) for bt in b]
 
             if not self._rank:
                 out_ids.extend(self._byte2tokenid[t] for t in tokens)
                 continue
 
-            def get_pairs(seq):
-                return {(seq[i], seq[i + 1]) for i in range(len(seq) - 1)}
-
-            pairs = get_pairs(tokens)
+            pairs = self._get_pairs(tokens)
+            # Greedy BPE merge loop on adjacent pairs by rank.
             while True:
                 best_pair, best_rank = None, None
                 for p in pairs:
@@ -137,7 +160,7 @@ class Tokenizer:
                 tokens = new_tokens
                 if len(tokens) == 1:
                     break
-                pairs = get_pairs(tokens)
+                pairs = self._get_pairs(tokens)
 
             out_ids.extend(self._byte2tokenid[tok] for tok in tokens)
 
@@ -147,7 +170,12 @@ class Tokenizer:
 # ---------- helpers ----------
 
 
-def _load_vocab_file(path):
+# =============================================================================
+# _load_vocab_file
+# Helper: read a JSON vocab mapping (id->byte-string or similar)
+# and normalize into id->bytes for internal use.
+# =============================================================================
+def _load_vocab_file(path: str) -> dict[int, bytes]:
     s = Path(path).read_text(encoding="utf-8").strip()
     out = {}
 
@@ -193,7 +221,7 @@ def _load_vocab_file(path):
     return out
 
 
-def _parse_token_literal(x):
+def _parse_token_literal(x: str) -> bytes:
     x = x.strip()
     try:
         lit = ast.literal_eval(x)
@@ -208,7 +236,12 @@ def _parse_token_literal(x):
     return x.encode("utf-8")
 
 
-def _load_merges_file(path):
+# =============================================================================
+# _load_merges_file
+# Helper: read merges file lines like 'ab cd' and return list[(b"ab", b"cd")].
+# The order of this list defines merge priority (earlier -> higher priority).
+# =============================================================================
+def _load_merges_file(path: str) -> list[tuple[bytes, bytes]]:
     s = Path(path).read_text(encoding="utf-8").strip()
     try:
         data = json.loads(s)
@@ -238,18 +271,3 @@ def _load_merges_file(path):
         b = _parse_token_literal(parts[1])
         merges.append((a, b))
     return merges
-
-
-# ---------- adapter for tests ----------
-
-
-def get_tokenizer(vocab=None, merges=None, special_tokens=None):
-    if vocab is not None and merges is not None:
-        return Tokenizer(vocab, merges, special_tokens)
-    raise ValueError("Provide either (vocab, merges).")
-
-
-def get_tokenizer_from_files(vocab_file=None, merges_file=None, special_tokens=None):
-    if vocab_file and merges_file:
-        return Tokenizer.from_files(vocab_file, merges_file, special_tokens)
-    raise ValueError("Provide either (vocab_file, merges_file).")
